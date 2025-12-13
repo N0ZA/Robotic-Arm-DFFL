@@ -33,7 +33,7 @@ from ultralytics import FastSAM
 
 def build_arg_parser():
     p = argparse.ArgumentParser(description="RealSense FastSAM shiny object detector")
-    p.add_argument("--model", default="yolo11m-seg.pt", help="Path to FastSAM model (default: Shiny/FastSAM-x.pt)")
+    p.add_argument("--model", default="yolo11s-seg.pt", help="Path to FastSAM model (default: Shiny/FastSAM-x.pt)")
     p.add_argument("--width", type=int, default=848, help="Color fram255 e width")
     p.add_argument("--height", type=int, default=480, help="Color frame height")
     p.add_argument("--fps", type=int, default=60,help="Camera FPS")
@@ -61,42 +61,155 @@ def sobel_operator(img):
     return gx, gy
 
 
-def preprocess_shiny_mask(gray, edge_method="sobel"):
+def preprocess_shiny_mask(gray, color_bgr, edge_method="sobel"):
     """Return a 1-channel uint8 mask (0 or 255) indicating candidate shiny regions.
-
-    Steps (light adaptation of notebook):
-    - small gaussian blur
-    - compute gradients (Farid or Sobel)
-    - gradient magnitude -> normalize
-    - binary threshold -> find contours -> filled mask
-    - mask + blur -> final threshold
+    
+    Improved algorithm using:
+    1. HSV color-space analysis for specular reflectance modeling
+    2. Adaptive thresholding for robustness to lighting variations
+    3. Combined gradient, brightness, and saturation criteria
+    
+    Args:
+        gray: Grayscale image (H, W) uint8
+        color_bgr: Color image (H, W, 3) BGR uint8
+        edge_method: "farid" or "sobel"
+    
+    Returns:
+        Binary mask (H, W) uint8 with values 0 or 255
     """
-    blur = cv2.GaussianBlur(gray, (1,1), 0)
+    # Step 1: Gaussian blur to reduce noise
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
 
+    # Step 2: Compute gradients (edge detection)
     if edge_method == "farid":
         gx, gy = farid_operator(blur)
     else:
         gx, gy = sobel_operator(blur)
 
     gradient_magnitude = cv2.magnitude(gx, gy)
-    # normalize to 0-255
     magnitude_norm = cv2.normalize(gradient_magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-    # coarse threshold to find edges/specular candidates
-    _, binary_edge = cv2.threshold(magnitude_norm, 60, 255, cv2.THRESH_BINARY)
+    # Step 3: Adaptive thresholding for gradient magnitude (instead of fixed threshold)
+    # Use Otsu's method to automatically determine optimal threshold
+    _, binary_edge = cv2.threshold(magnitude_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Apply morphological operations to clean up edge mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary_edge = cv2.morphologyEx(binary_edge, cv2.MORPH_CLOSE, kernel)
 
-    # find contours and fill them to create mask region
-    contours, _ = cv2.findContours(binary_edge, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Step 4: HSV color-space analysis for specular highlights
+    hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    
+    # Mask 1: High brightness (Value channel) - specular highlights are bright
+    # Use adaptive threshold for robustness
+    _, high_brightness_mask = cv2.threshold(v, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Further refine: only keep very bright regions (top 20% after Otsu)
+    bright_threshold = max(200, int(cv2.minMaxLoc(v)[1] * 0.8))
+    _, high_brightness_mask = cv2.threshold(v, bright_threshold, 255, cv2.THRESH_BINARY)
+    
+    # Mask 2: Low saturation - metallic/shiny surfaces reflect light with low color saturation
+    _, low_saturation_mask = cv2.threshold(s, 50, 255, cv2.THRESH_BINARY_INV)
+    
+    # Step 5: Combine masks using bitwise AND
+    # Shiny regions must have: strong edges AND high brightness AND low saturation
+    combined_mask = cv2.bitwise_and(binary_edge, high_brightness_mask)
+    combined_mask = cv2.bitwise_and(combined_mask, low_saturation_mask)
+    
+    # Step 6: Find contours and fill them to create solid regions
+    contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contour_mask = np.zeros_like(gray, dtype=np.uint8)
     if len(contours) > 0:
         cv2.drawContours(contour_mask, contours, -1, 255, thickness=-1)
-
-    # apply mask to grayscale, blur region and threshold to obtain bright metallic regions
-    masked_gray = cv2.bitwise_and(gray, gray, mask=contour_mask)
-    blurred = cv2.blur(masked_gray, (12, 12))
-    _, final_mask = cv2.threshold(blurred, 37, 255, cv2.THRESH_BINARY)
-
+    
+    # Step 7: ROI-based refinement - focus on center region
+    H, W = gray.shape
+    center_x, center_y = W // 2, H // 2
+    roi_radius = 200  # pixels from center
+    
+    # Create circular ROI mask
+    y_coords, x_coords = np.ogrid[:H, :W]
+    roi_mask = ((x_coords - center_x)**2 + (y_coords - center_y)**2 <= roi_radius**2).astype(np.uint8) * 255
+    
+    # Apply ROI mask to focus processing on center region
+    roi_contour_mask = cv2.bitwise_and(contour_mask, roi_mask)
+    
+    # Step 8: Final refinement with blur and threshold on brightness
+    masked_v = cv2.bitwise_and(v, v, mask=roi_contour_mask)
+    blurred = cv2.blur(masked_v, (12, 12))
+    
+    # Use adaptive threshold for final mask
+    _, final_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # Fallback: if Otsu gives empty result, use fixed threshold
+    if cv2.countNonZero(final_mask) == 0:
+        _, final_mask = cv2.threshold(blurred, 37, 255, cv2.THRESH_BINARY)
+    
     return final_mask
+
+
+def filter_masks_by_constraints(masks, image_shape, min_area_ratio=0.001, max_area_ratio=0.8, 
+                                 min_solidity=0.3, max_aspect_ratio=10.0):
+    """Filter masks based on size and shape constraints.
+    
+    Args:
+        masks: (n, H, W) boolean/uint8 array of masks
+        image_shape: (H, W) tuple
+        min_area_ratio: Minimum mask area as fraction of image area
+        max_area_ratio: Maximum mask area as fraction of image area
+        min_solidity: Minimum solidity (area / convex_hull_area)
+        max_aspect_ratio: Maximum bounding box aspect ratio
+    
+    Returns:
+        List of valid mask indices
+    """
+    if masks is None or len(masks) == 0:
+        return []
+    
+    H, W = image_shape
+    image_area = H * W
+    min_area = int(image_area * min_area_ratio)
+    max_area = int(image_area * max_area_ratio)
+    
+    valid_indices = []
+    
+    for i in range(len(masks)):
+        m = masks[i].astype(np.uint8)
+        
+        # Calculate area
+        area = cv2.countNonZero(m)
+        
+        # Filter by area
+        if area < min_area or area > max_area:
+            continue
+        
+        # Get contours for shape analysis
+        contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) == 0:
+            continue
+        
+        # Use the largest contour
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        # Calculate solidity (area / convex hull area)
+        hull = cv2.convexHull(largest_contour)
+        hull_area = cv2.contourArea(hull)
+        if hull_area > 0:
+            solidity = area / hull_area
+            if solidity < min_solidity:
+                continue
+        
+        # Calculate aspect ratio from bounding box
+        x, y, w, h = cv2.boundingRect(largest_contour)
+        if h > 0:
+            aspect_ratio = w / h
+            # Check both orientations
+            if aspect_ratio > max_aspect_ratio and (1.0 / aspect_ratio) > max_aspect_ratio:
+                continue
+        
+        valid_indices.append(i)
+    
+    return valid_indices
 
 def extract_masks_from_results(results):
     """Robust extractor for mask arrays from ultralytics FastSAM results.
@@ -135,11 +248,32 @@ def extract_masks_from_results(results):
     return masks
 
 
-def choose_mask_closest_to_center(masks, image_shape):
+def choose_mask_closest_to_center(masks, image_shape, min_area_ratio=0.001, max_area_ratio=0.8):
     """Given masks (n,H,W) boolean/uint8 and image_shape (H,W), return index of mask whose centroid
-    is closest to the image center. Returns -1 if masks is empty.
+    is closest to the image center, with size and shape filtering. Returns -1 if masks is empty.
+    
+    Args:
+        masks: (n,H,W) boolean/uint8 array
+        image_shape: (H, W) tuple
+        min_area_ratio: Minimum mask area as fraction of image area
+        max_area_ratio: Maximum mask area as fraction of image area
+    
+    Returns:
+        Index of selected mask or -1
     """
     if masks is None or len(masks) == 0:
+        return -1
+
+    # Filter masks by size and shape constraints
+    valid_indices = filter_masks_by_constraints(
+        masks, image_shape,
+        min_area_ratio=min_area_ratio,
+        max_area_ratio=max_area_ratio,
+        min_solidity=0.3,
+        max_aspect_ratio=10.0
+    )
+    
+    if len(valid_indices) == 0:
         return -1
 
     H, W = image_shape
@@ -148,9 +282,9 @@ def choose_mask_closest_to_center(masks, image_shape):
     best_idx = -1
     best_dist = float('inf')
 
-    for i in range(len(masks)):
+    for i in valid_indices:
         m = masks[i].astype(np.uint8)
-        # compute centroid robustly
+        # Compute centroid robustly
         ys, xs = np.where(m > 0)
         if len(xs) == 0:
             continue
@@ -164,13 +298,35 @@ def choose_mask_closest_to_center(masks, image_shape):
     return best_idx
 
 
-def choose_mask_lowest_depth_within_radius(masks, depth_img, image_shape, radius=80):
+def choose_mask_lowest_depth_within_radius(masks, depth_img, image_shape, radius=80,
+                                           min_area_ratio=0.001, max_area_ratio=0.8):
     """Select the mask whose centroid lies within `radius` pixels from image center
-    and has the lowest median depth value. `masks` is (n,H,W) boolean array. `depth_img`
-    should be a 2D ndarray of depth in meters (or raw units) with shape (H,W), or None.
-    Returns the selected index or -1 if none found.
+    and has the lowest median depth value, with size and shape filtering.
+    
+    Args:
+        masks: (n,H,W) boolean array
+        depth_img: 2D ndarray of depth in meters (or raw units) with shape (H,W), or None
+        image_shape: (H, W) tuple
+        radius: Maximum distance from center in pixels
+        min_area_ratio: Minimum mask area as fraction of image area
+        max_area_ratio: Maximum mask area as fraction of image area
+    
+    Returns:
+        Selected index or -1 if none found
     """
     if masks is None or len(masks) == 0:
+        return -1
+
+    # Step 1: Filter masks by size and shape constraints
+    valid_indices = filter_masks_by_constraints(
+        masks, image_shape, 
+        min_area_ratio=min_area_ratio, 
+        max_area_ratio=max_area_ratio,
+        min_solidity=0.3,
+        max_aspect_ratio=10.0
+    )
+    
+    if len(valid_indices) == 0:
         return -1
 
     H, W = image_shape
@@ -179,7 +335,8 @@ def choose_mask_lowest_depth_within_radius(masks, depth_img, image_shape, radius
     best_idx = -1
     best_val = float('inf')
 
-    for i in range(len(masks)):
+    # Step 2: Among valid masks, select based on depth and proximity to center
+    for i in valid_indices:
         m = masks[i].astype(np.uint8)
         ys, xs = np.where(m > 0)
         if len(xs) == 0:
@@ -188,12 +345,13 @@ def choose_mask_lowest_depth_within_radius(masks, depth_img, image_shape, radius
         mx = xs.mean()
         my = ys.mean()
         dist_to_center = np.hypot(mx - cx, my - cy)
-        # only consider masks whose centroid is within the radius
+        
+        # Only consider masks whose centroid is within the radius
         if dist_to_center > radius:
             continue
 
         if depth_img is not None:
-            # make sure depth image matches shape; if not, try to resize
+            # Make sure depth image matches shape; if not, try to resize
             try:
                 if depth_img.shape != (H, W):
                     depth_resized = cv2.resize(depth_img, (W, H), interpolation=cv2.INTER_NEAREST)
@@ -203,17 +361,18 @@ def choose_mask_lowest_depth_within_radius(masks, depth_img, image_shape, radius
                 depth_resized = depth_img
 
             depths = depth_resized[ys, xs]
-            # ignore zero/invalid depth values
+            # Ignore zero/invalid depth values
             valid = depths > 0
             if not np.any(valid):
                 continue
             median_depth = float(np.median(depths[valid]))
-            # smaller median_depth means closer to camera
+            
+            # Smaller median_depth means closer to camera
             if median_depth < best_val:
                 best_val = median_depth
                 best_idx = i
         else:
-            # no depth available: pick the one closest to center (as fallback)
+            # No depth available: pick the one closest to center (as fallback)
             if dist_to_center < best_val:
                 best_val = dist_to_center
                 best_idx = i
@@ -311,8 +470,8 @@ def main():
 
             gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
 
-            # create candidate shiny mask
-            shiny_mask = preprocess_shiny_mask(gray, edge_method=args.edge_method)
+            # create candidate shiny mask with improved algorithm
+            shiny_mask = preprocess_shiny_mask(gray, color, edge_method=args.edge_method)
 
             # prepare masked color image for model
             masked_color = cv2.bitwise_and(color, color, mask=shiny_mask)
@@ -352,8 +511,6 @@ def main():
 
             overlay = color.copy()
             info_text = "No detection"
-            xyz_coords = None
-            
             if selected_idx >= 0:
                 m = masks[selected_idx]
                 
@@ -369,77 +526,14 @@ def main():
                 # Create colored overlay (green)
                 overlay[m_u8 == 255] = (255, 0, 0)
 
-                # compute bounding box and centroid from mask
+                # compute bounding box from mask
                 ys, xs = np.where(m_u8 == 255)
                 if len(xs) > 0:
                     x0, x1 = int(xs.min()), int(xs.max())
                     y0, y1 = int(ys.min()), int(ys.max())
-                    
-                    # Calculate centroid coordinates (X, Y)
-                    # ... (lines 420-428 remain the same: getting centroid_x, centroid_y)
-                    # ...
-                    centroid_x = int(xs.mean())
-                    centroid_y = int(ys.mean())
-
-                    # --- START MODIFIED Z-DEPTH RETRIEVAL ---
-                    z_depth = None
-                    depth_resized = None
-
-                    if depth_frame:
-                        # 1. Retrieve the depth array (identical logic to the selection function)
-                        try:
-                            H, W = overlay.shape[:2]
-                            depth_img_raw = np.asanyarray(depth_frame.get_data()).astype(np.float32)
-
-                            # Check for resizing/alignment consistency
-                            if depth_img_raw.shape != (H, W):
-                                # This is critical: ensure the depth array matches the color frame resolution
-                                depth_resized = cv2.resize(depth_img_raw, (W, H), interpolation=cv2.INTER_NEAREST)
-                            else:
-                                depth_resized = depth_img_raw
-                                
-                            # Apply depth scale if known
-                            if depth_scale is not None:
-                                depth_resized *= float(depth_scale)
-                                
-                            # 2. Extract depths under the *selected* mask
-                            ys_mask, xs_mask = np.where(m_u8 > 0)
-                            depths_under_mask = depth_resized[ys_mask, xs_mask]
-                            
-                            # 3. Calculate the median depth (robust against noise/holes)
-                            valid_depths = depths_under_mask[depths_under_mask > 0]
-                            
-                            if len(valid_depths) > 0:
-                                z_depth = float(np.median(valid_depths))
-                                
-                        except Exception as e:
-                            # Catch any array access or conversion error
-                            print(f"Error calculating median depth from array: {e}")
-                            z_depth = None
-
-                    # --- END MODIFIED Z-DEPTH RETRIEVAL ---
-
-                    # Store XYZ coordinates
-                    xyz_coords = {
-                        'x': centroid_x,
-                        'y': centroid_y,
-                        'z': z_depth
-                    }
-
-                    # Draw bounding box and centroid marker
                     cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                    cv2.circle(overlay, (centroid_x, centroid_y), 5, (0, 255, 255), -1) # Yellow centroid # Yellow centroid
+                    info_text = f"Selected object idx={selected_idx} bbox=({x0},{y0},{x1},{y1})"
 
-                    # Update info text with XYZ coordinates
-                    if z_depth is not None:
-                        # Use 3D information from RealSense to calculate 3D coordinates (Optional but better)
-                        # The rs.rs2_deproject_pixel_to_point function would convert the 2D pixel to 3D point
-                        # Since we don't have the camera intrinsic parameters here, we stick to (X, Y) pixel and Z depth.
-                        info_text = f"Centroid (Z): ({centroid_x}px, {centroid_y}px, {z_depth:.3f}m)"
-                    else:
-                        info_text = f"Centroid (XY): ({centroid_x}px, {centroid_y}px) Z: N/A"
-
-# ... (rest of the code continues)
             # show small preview of mask at the right side
             mask_rgb = cv2.cvtColor(shiny_mask, cv2.COLOR_GRAY2BGR)
             h, w = overlay.shape[:2]

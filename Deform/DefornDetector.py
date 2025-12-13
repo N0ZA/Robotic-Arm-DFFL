@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-realsense_sachet_detector.py
+realsense_Object (deformed)_detector.py
 
-Real-time sachet detector using Intel RealSense (color + depth) with YOLO11-seg.
+Real-time Object (deformed) detector using Intel RealSense (color + depth) with YOLO11-seg.
 
 Behavior:
 - Streams color and depth, aligns depth to color
@@ -10,9 +10,8 @@ Behavior:
   (Sobel X/Y with ksize=3, convertScaleAbs, addWeighted, threshold at 120 using THRESH_TOZERO)
 - Converts white parts of the processed image to RGB by masking the original color image
 - Runs YOLO11-seg on the masked RGB image for segmentation
-- Finds contours, computes perimeters and filters them by min/max perimeters (120.0 - 200.0)
-- For each filtered contour, computes centroid in the resized image and maps it back to
-  the original color resolution to query the aligned depth frame for the Z coordinate
+- Finds contours from YOLO segmentation masks
+- Selects only ONE object (closest to center) and displays its XYZ coordinates
 - Overlays contours, centroid and (x, y, z) on the display and runs continuously
 
 Requires: pyrealsense2, numpy, opencv-python, ultralytics
@@ -42,11 +41,11 @@ def clamp(v, a, b):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Real-time sachet detector using Intel RealSense with YOLO11-seg")
-    parser.add_argument("--min-perim", type=float, default=120.0, help="Minimum contour perimeter to consider (default 120.0)")
-    parser.add_argument("--max-perim", type=float, default=200.0, help="Maximum contour perimeter to consider (default 200.0)")
+    parser = argparse.ArgumentParser(description="Real-time Object (deformed) detector using Intel RealSense with YOLO11-seg")
+    parser.add_argument("--min-perim", type=float, default=150.0, help="Minimum contour perimeter to consider (default 150.0)")
+    parser.add_argument("--max-perim", type=float, default=220.0, help="Maximum contour perimeter to consider (default 220.0)")
     parser.add_argument("--fps", type=int, default=30, help="Stream frames per second (default 30)")
-    parser.add_argument("--yolo-model", type=str, default="yolo11s-seg.pt", help="YOLO11-seg model path (default yolo11n-seg.pt)")
+    parser.add_argument("--yolo-model", type=str, default="yolo11s-seg.pt", help="YOLO11-seg model path (default yolo11s-seg.pt)")
     parser.add_argument("--yolo-conf", type=float, default=0.25, help="YOLO confidence threshold (default 0.25)")
     args = parser.parse_args()
 
@@ -61,14 +60,14 @@ def main():
     except Exception as e:
         print(f"Failed to load YOLO model: {e}")
         print("Make sure you have the correct model file. You can download it with:")
-        print("  from ultralytics import YOLO; YOLO('yolo11n-seg.pt')")
+        print("  from ultralytics import YOLO; YOLO('yolo11s-seg.pt')")
         sys.exit(1)
 
     # Start RealSense
     pipeline = rs.pipeline()
     config = rs.config()
-    config.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, args.fps)
-    config.enable_stream(rs.stream.color, 848, 480, rs.format.bgr8, args.fps)
+    config.enable_stream(rs.stream.depth, 480, 270, rs.format.z16, args.fps)
+    config.enable_stream(rs.stream.color, 480, 270, rs.format.bgr8, args.fps)
 
     try:
         profile = pipeline.start(config)
@@ -87,7 +86,7 @@ def main():
     except Exception:
         depth_scale = None
 
-    window_name = "RealSense Sachet Detector with YOLO11-seg"
+    window_name = "RealSense Object (deformed) Detector with YOLO11-seg"
     cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
     try:
